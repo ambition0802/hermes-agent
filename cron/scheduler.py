@@ -127,6 +127,9 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     origin = job.get("origin")
     if not origin:
         return None
+    if not isinstance(origin, dict):
+        # origin may be a free-form provenance string from migration scripts
+        return None
     platform = origin.get("platform")
     chat_id = origin.get("chat_id")
     if platform and chat_id:

@@ -647,6 +647,169 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("oneshot-stale")["next_run_at"] is None
 
+    def test_recurring_cron_null_next_run_is_recovered(self, tmp_cron_dir):
+        """Cron jobs with null next_run_at (e.g. written by external scripts)
+        must be recomputed. If the computed next_run is in the future, the job
+        is not due yet, but next_run_at must be set so the job fires on schedule.
+        """
+        pytest.importorskip("croniter")
+        now = datetime(2026, 3, 18, 4, 22, 30, tzinfo=timezone.utc)
+        save_jobs([{
+            "id": "cron-recover",
+            "name": "Daily Digest",
+            "prompt": "AI Daily Digest",
+            "schedule": {"kind": "cron", "expr": "0 12 * * *", "display": "0 12 * * *"},
+            "schedule_display": "0 12 * * *",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        # next_run_at is set to 12:00 UTC on the next day — not due yet
+        assert len(due) == 0
+        job = get_job("cron-recover")
+        assert job is not None
+        assert job["next_run_at"] is not None
+        assert isinstance(job["next_run_at"], str)
+
+    def test_recurring_interval_null_next_run_is_recovered(self, tmp_cron_dir):
+        """Interval jobs with null next_run_at must be recomputed. Since next_run
+        is now + interval, it will be in the future and not immediately due,
+        but the job is now schedulable.
+        """
+        save_jobs([{
+            "id": "interval-recover",
+            "name": "Hourly Check",
+            "prompt": "Check system status",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+            "schedule_display": "every 1h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        # next_run_at is now + 60 minutes — not due yet
+        assert len(due) == 0
+        job = get_job("interval-recover")
+        assert job is not None
+        assert job["next_run_at"] is not None
+        # Interval next_run_at should be in the future
+        from cron.jobs import _ensure_aware, _hermes_now
+        next_dt = _ensure_aware(datetime.fromisoformat(job["next_run_at"]))
+        assert next_dt > _hermes_now()
+
+    def test_recurring_null_next_run_unknown_kind_warned_and_skipped(self, tmp_cron_dir):
+        """Recurring jobs with null next_run_at but unknown/invalid kind should
+        be logged with a warning and skipped rather than silently ignored.
+        """
+        save_jobs([{
+            "id": "unknown-kind",
+            "name": "Broken job",
+            "prompt": "...",
+            "schedule": {"kind": "unknown", "display": "weird"},
+            "schedule_display": "weird",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": None,
+            "last_run_at": None,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        assert due == []
+
+    def test_recurring_interval_null_next_run_is_due_within_grace(self, tmp_cron_dir, monkeypatch):
+        """Interval job with null next_run_at but a recent last_run_at within the
+        grace window should be due. This simulates a job where last_run_at is known
+        but next_run_at was never set (e.g. by an external writer).
+        """
+        from datetime import datetime, timedelta, timezone
+        now = datetime(2026, 3, 18, 4, 30, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        # Job was last run exactly one hour ago — next_run_at = last_run + 60 min = now
+        last_run = (now - timedelta(minutes=60)).isoformat()
+        save_jobs([{
+            "id": "interval-due",
+            "name": "Hourly poll",
+            "prompt": "Poll API",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+            "schedule_display": "every 1h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "scheduled",
+            "next_run_at": None,
+            "last_run_at": last_run,
+            "last_status": None,
+            "last_error": None,
+            "deliver": "local",
+            "origin": None,
+        }])
+
+        due = get_due_jobs()
+        # next_run_at = last_run + 60 min = now, so due
+        assert len(due) == 1
+        job = get_job("interval-due")
+        assert job["next_run_at"] is not None
+
+
+class TestResolveOrigin:
+    """Tests for _resolve_origin() — defensive handling of non-dict origin values."""
+
+    def test_dict_origin_returns_origin(self):
+        from cron.scheduler import _resolve_origin
+        job = {"origin": {"platform": "telegram", "chat_id": "123"}}
+        result = _resolve_origin(job)
+        assert result == {"platform": "telegram", "chat_id": "123"}
+
+    def test_string_origin_returns_none(self):
+        from cron.scheduler import _resolve_origin
+        # Migration scripts may tag jobs with a free-form provenance string
+        job = {"origin": "combined-digest-replaces-x-ai-and-email-triage-20260503"}
+        result = _resolve_origin(job)
+        assert result is None
+
+    def test_null_origin_returns_none(self):
+        from cron.scheduler import _resolve_origin
+        job = {"origin": None}
+        result = _resolve_origin(job)
+        assert result is None
+
+    def test_no_origin_key_returns_none(self):
+        from cron.scheduler import _resolve_origin
+        job = {"id": "x"}
+        result = _resolve_origin(job)
+        assert result is None
+
+    def test_int_origin_returns_none(self):
+        from cron.scheduler import _resolve_origin
+        job = {"origin": 42}
+        result = _resolve_origin(job)
+        assert result is None
+
+    def test_list_origin_returns_none(self):
+        from cron.scheduler import _resolve_origin
+        job = {"origin": ["telegram", "123"]}
+        result = _resolve_origin(job)
+        assert result is None
+
 
 class TestEnabledToolsets:
     def test_enabled_toolsets_stored(self, tmp_cron_dir):
