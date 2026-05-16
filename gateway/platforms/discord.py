@@ -111,6 +111,7 @@ def check_discord_requirements() -> bool:
     Intents = _Intents
     commands = _commands
     DISCORD_AVAILABLE = True
+    _define_discord_views()
     return True
 
 
@@ -4881,7 +4882,17 @@ def _component_check_auth(
     return False
 
 
-if DISCORD_AVAILABLE:
+def _define_discord_views():
+    """Define Discord View subclasses.
+
+    Must be called after ``discord`` is available — either at module load
+    (when discord.py is pre-installed) or from ``check_discord_requirements()``
+    after a successful lazy install.  The function is intentionally
+    idempotent: re-calling it after the classes already exist is harmless.
+    """
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    if not DISCORD_AVAILABLE or discord is None:
+        return
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -5581,3 +5592,9 @@ if DISCORD_AVAILABLE:
             self.resolved = True
             for child in self.children:
                 child.disabled = True
+
+
+# Define View classes now if discord was available at import time.
+# If discord is lazily installed later, check_discord_requirements() will
+# call _define_discord_views() after the install succeeds.
+_define_discord_views()
